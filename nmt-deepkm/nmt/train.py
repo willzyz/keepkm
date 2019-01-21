@@ -444,9 +444,109 @@ def get_model_creator(hparams):
   else:
     raise ValueError("Unknown attention architecture %s" %
                      hparams.attention_architecture)
-  return model_creator
+  return model_creator 
 
+def train_deepkmeans(hparams, scope=None, target_session=""): 
+  
+  ## logic: 
+  
+  ## create the model and build the graph with both h-output as session-run target 
+  ## and with nca objective and update as session-run target
+  
+  ## create a textlinedataset [DataAllSequences] with all text data 
+  
+  ## for loop epoch: {
+  
+  ## forward propagate the whole dataset DataAllSequences through 
+  ## the model [session.run(h-output)] to obtain HvecAllSequences 
+  
+  ## perform pca and k-means on the numpy array of hidden embedding 
+  ## data and obtain centroids and cluster assignments, we can use a large set, e.g. 5000 
+  ## at first for language model word prediction routing. (Later, consider a small set, e.g. 50 for
+  ## sentiment classification routing) 
+  
+  ## create a zipped dataset [ZippedClusDataset] across 
+  ## [DataAllSequences, Centroids, ClusterAssignment] 
+  ## and create an iterator [FinetuneClusIterator] for iterative gd optimization 
+  
+  ## for loop step: iteratively train the model using session.run(model-finetune-update) 
+  ## }   
+  
+  model_creator = get_model_creator(hparams)
+  
+  dkm_forward_model = model_helper.create_deepkm_train_model(model_creator, hparams, scope=scope) 
+  
+  # TensorFlow model
+  config_proto = utils.get_config_proto(
+      log_device_placement=hparams.log_device_placement,
+      num_intra_threads=hparams.num_intra_threads,
+      num_inter_threads=hparams.num_inter_threads)
+  
+  train_forward_sess = tf.Session(
+      target=target_session, config=config_proto, graph=dkm_forward_model.graph)
+  
+  ## later: create a batching algorithm to forward propagate the data
+  
+  with dkm_forward_model.graph.as_default(): 
+    train_forward_sess.run(tf.global_variables_initializer())
+    train_forward_sess.run(tf.tables_initializer())
+    train_forward_sess.run(dkm_forward_model.iterator.initializer)
+    data_seq_lens, result_outputs, result_state = train_forward_sess.run(
+      [dkm_forward_model.iterator.source_sequence_length, 
+       dkm_forward_model.model.km_encoder_outputs, 
+       dkm_forward_model.model.km_encoder_state])    
+  
+  #indices = raw_ids_data[1]
+  g = tf.Graph()
+  with g.as_default(): 
+    num_samples = hparams.dkm_dataset_size
+    index_0 = tf.reshape(data_seq_lens, [1, 50000, 1])
+    index_0 = tf.add(index_0, -1)
+    index_1 = tf.reshape(tf.range(num_samples), [1, num_samples, 1])
+    index = tf.squeeze(tf.stack([index_0, index_1], axis=2), [3])
+    res = tf.gather_nd(result_outputs, index)
+    res = tf.squeeze(res)
+  
+  temp_sess = tf.Session(config=config_proto, graph=g)
+  with g.as_default():
+    res_val = temp_sess.run(res)
 
+  import ipdb; ipdb.set_trace()    
+
+  from kmtools import Kmeans
+  KM = Kmeans(50)
+  assignment, loss = KM.cluster(res_val)
+  print('loss: ' + str(loss)) 
+  print(assignment)
+  
+  import ipdb; ipdb.set_trace()  
+  
+  """  
+  
+  dkm_model.reset_iterator(dkm_batch_iterator) 
+
+  global_steps = 0
+  for epoch in range(hparams.dkm_max_epochs):
+    ##---- for epoch loop ---- 
+    HvecAllSequences = sess.run(dkm_model.h_output)
+    
+    Centroids, ClusterAssignment = kmtools.Run_PCA_Kmeans(HvecAllSequences, hparams.dkm_num_centroids)
+    ZippedClusDataset = tf.data.Dataset.zip((DataAllSequences, Centroids, ClusterAssignment))
+    
+    dkm_ft_iterator = iterator_utils.get_dkm_finetune_iterator(ZippedClusDataset)
+    
+    dkm_model.reset_iterator(dkm_ft_iterator)
+    
+    for step in range(hparams.dkm_num_steps_per_epoch): ## epoch_size * 1.0 / batch_size 
+      sess.run(dkm_model.finetune_update); global_steps = global_steps + 1
+      if global_steps % hparams.dkm_print_every == 0:
+        print('--- DKM optimize global fine-tune step: ' + str(global_steps) + ' ---') 
+    
+    dkm_model.save_model_ckpt()
+
+  return global_steps  
+  """
+  
 def train(hparams, scope=None, target_session=""):
   """Train a translation model."""
   log_device_placement = hparams.log_device_placement

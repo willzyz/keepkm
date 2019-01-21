@@ -10,7 +10,7 @@ import numpy as np
 ## next steps: test the assignment function
 ## next next steps: integrate with NMT code
 
-def preprocess_features(npdata, pca=256):
+def preprocess_features(npdata, pca=100):
     """Preprocess an array of features.
     Args:
         npdata (np.array N * ndim): features to preprocess
@@ -142,4 +142,4 @@ class Kmeans:
         if verbose:
             print('k-means time: {0:.0f} s'.format(time.time() - end))
 
-        return loss
+        return I, loss

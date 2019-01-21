@@ -22,7 +22,7 @@ import tensorflow as tf
 from ..utils import vocab_utils
 
 
-__all__ = ["BatchedInput", "get_iterator", "get_infer_iterator"]
+__all__ = ["BatchedInput", "KMBatchedFullInput", "get_iterator", "get_infer_iterator"]
 
 
 # NOTE(ebrevdo): When we subclass this, instances' __dict__ becomes empty.
@@ -33,6 +33,11 @@ class BatchedInput(
                             "target_sequence_length"))):
   pass
 
+class KMBatchedFullInput(
+    collections.namedtuple("KMBatchedFullInput",
+                           ("initializer", "source", 
+                            "source_sequence_length"))):
+  pass
 
 def get_infer_iterator(src_dataset,
                        src_vocab_table,
@@ -82,7 +87,7 @@ def get_infer_iterator(src_dataset,
         padding_values=(
             src_eos_id,  # src
             0))  # src_len -- unused
-
+  
   batched_dataset = batching_func(src_dataset)
   batched_iter = batched_dataset.make_initializable_iterator()
   (src_ids, src_seq_len) = batched_iter.get_next()
@@ -93,7 +98,6 @@ def get_infer_iterator(src_dataset,
       target_output=None,
       source_sequence_length=src_seq_len,
       target_sequence_length=None)
-
 
 def get_iterator(src_dataset,
                  tgt_dataset,
@@ -112,7 +116,8 @@ def get_iterator(src_dataset,
                  num_shards=1,
                  shard_index=0,
                  reshuffle_each_iteration=True,
-                 use_char_encode=False):
+                 use_char_encode=False):  
+  
   if not output_buffer_size:
     output_buffer_size = batch_size * 1000
 
@@ -137,11 +142,11 @@ def get_iterator(src_dataset,
       lambda src, tgt: (
           tf.string_split([src]).values, tf.string_split([tgt]).values),
       num_parallel_calls=num_parallel_calls).prefetch(output_buffer_size)
-
+  
   # Filter zero length input sequences.
   src_tgt_dataset = src_tgt_dataset.filter(
       lambda src, tgt: tf.logical_and(tf.size(src) > 0, tf.size(tgt) > 0))
-
+  
   if src_max_len:
     src_tgt_dataset = src_tgt_dataset.map(
         lambda src, tgt: (src[:src_max_len], tgt),
@@ -150,7 +155,7 @@ def get_iterator(src_dataset,
     src_tgt_dataset = src_tgt_dataset.map(
         lambda src, tgt: (src, tgt[:tgt_max_len]),
         num_parallel_calls=num_parallel_calls).prefetch(output_buffer_size)
-
+  
   # Convert the word strings to ids.  Word strings that are not in the
   # vocab get the lookup table's default_value integer.
   if use_char_encode:
@@ -163,7 +168,7 @@ def get_iterator(src_dataset,
         lambda src, tgt: (tf.cast(src_vocab_table.lookup(src), tf.int32),
                           tf.cast(tgt_vocab_table.lookup(tgt), tf.int32)),
         num_parallel_calls=num_parallel_calls)
-
+  
   src_tgt_dataset = src_tgt_dataset.prefetch(output_buffer_size)
   # Create a tgt_input prefixed with <sos> and a tgt_output suffixed with <eos>.
   src_tgt_dataset = src_tgt_dataset.map(
@@ -171,6 +176,7 @@ def get_iterator(src_dataset,
                         tf.concat(([tgt_sos_id], tgt), 0),
                         tf.concat((tgt, [tgt_eos_id]), 0)),
       num_parallel_calls=num_parallel_calls).prefetch(output_buffer_size)
+ 
   # Add in sequence lengths.
   if use_char_encode:
     src_tgt_dataset = src_tgt_dataset.map(
@@ -246,3 +252,82 @@ def get_iterator(src_dataset,
       target_output=tgt_output_ids,
       source_sequence_length=src_seq_len,
       target_sequence_length=tgt_seq_len)
+
+def get_dkm_batch_iterator(
+                 train_dataset,
+                 vocab_table,
+                 dataset_size,
+                 eos,
+                 src_max_len=None,
+                 num_parallel_calls=4,
+                 output_buffer_size=None,  
+                 num_shards=1,
+                 shard_index=0):
+  
+  if not output_buffer_size:
+    output_buffer_size = dataset_size * 1000 
+  
+  eos_id = tf.cast(vocab_table.lookup(tf.constant(eos)), tf.int32)
+  
+  train_dataset = train_dataset.shard(num_shards, shard_index)
+    
+  ## split the strings (according to space) into words 
+  train_dataset = train_dataset.map(
+      lambda src: (
+          tf.string_split([src]).values),
+      num_parallel_calls=num_parallel_calls).prefetch(output_buffer_size)
+  
+  # Filter zero length input sequences.
+  train_dataset = train_dataset.filter(
+      lambda src: (tf.size(src) > 0))
+  
+  if src_max_len:
+    train_dataset = train_dataset.map(
+        lambda src: (src[:src_max_len]),
+        num_parallel_calls=num_parallel_calls).prefetch(output_buffer_size)
+  
+  # Convert the word strings to ids.  Word strings that are not in the
+  # vocab get the lookup table's default_value integer.
+  
+  train_dataset = train_dataset.map( 
+        lambda src: (tf.cast(vocab_table.lookup(src), tf.int32)), 
+        num_parallel_calls=num_parallel_calls) 
+  
+  train_dataset = train_dataset.prefetch(output_buffer_size) 
+  
+  train_dataset = train_dataset.map( 
+    lambda src: ( 
+      src, tf.size(src)), 
+    num_parallel_calls=num_parallel_calls) 
+  
+  train_dataset = train_dataset.prefetch(output_buffer_size) 
+  
+  # Bucket by source sequence length (buckets for lengths 0-9, 10-19, ...) 
+  def batching_func(x): 
+    return x.padded_batch( 
+        dataset_size, 
+        # The first three entries are the source and target line rows; 
+        # these have unknown-length vectors.  The last two entries are 
+        # the source and target row sizes; these are scalars. 
+        padded_shapes=( 
+            tf.TensorShape([None]),  # src 
+            tf.TensorShape([])),  # src_len 
+        # Pad the source and target sequences with eos tokens. 
+        # (Though notice we don't generally need to do this since 
+        # later on we will be masking out calculations past the true sequence. 
+        padding_values=( 
+            eos_id, # src 
+            0)  # src_len -- unused 
+        ) 
+  batched_dataset = batching_func(train_dataset) 
+  
+  batched_iter = batched_dataset.make_initializable_iterator() 
+  
+  (src_ids, src_seq_len) = (batched_iter.get_next())
+  
+  #(src_ids, src_seq_len) = batched_dataset.take(dataset_size)
+  
+  return KMBatchedFullInput(
+    initializer=batched_iter.initializer,
+      source=src_ids,
+      source_sequence_length=src_seq_len)
